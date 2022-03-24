@@ -20,6 +20,10 @@ enum Expr {
     Ref {
         var: VarId,
     },
+    Pair {
+        e1: Box<Expr>,
+        e2: Box<Expr>,
+    },
     Zero,
     True,
     Add,
@@ -50,6 +54,12 @@ macro_rules! ast {
             arg: Box::new(ast!($arg)),
         }
     };
+    (pair $e1:tt $e2:tt) => {
+        Expr::Pair {
+            e1: Box::new(ast!($e1)),
+            e2: Box::new(ast!($e2)),
+        }
+    };
     (zero) => {
         Expr::Zero
     };
@@ -70,6 +80,7 @@ enum Type {
     Fun(Box<Type>, Box<Type>),
     Int,
     Bool,
+    Pair(Box<Type>, Box<Type>),
     PolyVar(VarId),
 }
 
@@ -100,6 +111,10 @@ impl TypeVariables for Vec<RefCell<(Option<Type>, usize)>> {
             (Fun(in1, out1), Fun(in2, out2)) => {
                 self.unify(in1, in2);
                 self.unify(out1, out2);
+            }
+            (Pair(head1, tail1), Pair(head2, tail2)) => {
+                self.unify(head1, head2);
+                self.unify(tail1, tail2);
             }
             (TyVar(ref1), TyVar(ref2)) => {
                 if ref1 == ref2 {
@@ -161,6 +176,7 @@ impl Type {
                 }
             }
             Fun(arg, ret) => Fun(Box::new(arg.generalize(ctx)), Box::new(ret.generalize(ctx))),
+            Pair(t1, t2) => Pair(Box::new(t1.generalize(ctx)), Box::new(t2.generalize(ctx))),
             Int | Bool | PolyVar(_) => self,
         }
     }
@@ -179,6 +195,10 @@ impl Type {
             Fun(arg, ret) => Fun(
                 Box::new(arg.instantiate_inner(ctx, var_map)),
                 Box::new(ret.instantiate_inner(ctx, var_map)),
+            ),
+            Pair(t1, t2) => Pair(
+                Box::new(t1.instantiate_inner(ctx, var_map)),
+                Box::new(t2.instantiate_inner(ctx, var_map)),
             ),
             TyVar(var_id) => {
                 let t = ctx.ty_vars[*var_id].borrow().0.clone();
@@ -207,13 +227,11 @@ impl Inferer {
     fn infer(&mut self, env: &mut TyEnv, expr: &Expr) -> Type {
         match expr {
             Expr::Let { new_var, def, body } => {
-                let mut t1 = self.fresh_tyvar();
                 self.level += 1;
-                let t2 = self.infer(env, def);
+                let t_def = self.infer(env, def);
                 self.level -= 1;
-                let mut t2 = t2.generalize(self);
-                self.ty_vars.unify(&mut t1, &mut t2);
-                env.extended(*new_var, t1, |env| self.infer(env, body))
+                let t_def = t_def.generalize(self);
+                env.extended(*new_var, t_def, |env| self.infer(env, body))
             }
             Expr::Fun { arg, body } => {
                 let t1 = self.fresh_tyvar();
@@ -240,6 +258,11 @@ impl Inferer {
                 }
                 _ => panic!("apply non-fun type"),
             },
+            Expr::Pair { e1, e2 } => {
+                let t1 = self.infer(env, e1);
+                let t2 = self.infer(env, e2);
+                Type::Pair(Box::new(t1), Box::new(t2))
+            }
             Expr::Zero => Type::Int,
             Expr::True => Type::Bool,
             Expr::Add => Type::Fun(
@@ -269,8 +292,7 @@ impl TyEnv {
 fn main() {
     let ast = ast!(
         let 0 = (fun 1 => (ref 1)) in (
-            let 2 = (app (ref 0) zero) in
-            (app (ref 0) true)
+            (pair (app (ref 0) zero) (app (ref 0) true))
         )
     );
     let mut inferer = Inferer::new();
