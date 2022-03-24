@@ -291,9 +291,20 @@ impl TyEnv {
 
 fn main() {
     let ast = ast!(
-        let 0 = (fun 1 => (ref 1)) in (
-            (pair (app (ref 0) zero) (app (ref 0) true))
-        )
+        let 0 = (
+            fun 1 => (
+                let 2 = (
+                    fun 3 => (pair (ref 1) (ref 3))
+                ) in (
+                ref 2
+                )
+            )
+        ) in (
+        let 4 = (app (ref 0) zero) in (
+        let 5 = (app (ref 4) true) in (
+        let 6 = (app (ref 0) (ref 5)) in (
+        app (ref 6) true
+        ))))
     );
     let mut inferer = Inferer::new();
     let t = inferer.infer(&mut TyEnv::new(), &ast);
