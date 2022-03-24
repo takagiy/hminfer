@@ -1,6 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap};
+use std::{cell::RefCell, collections::HashMap};
 
 type VarId = usize;
 
@@ -152,20 +150,18 @@ impl Type {
             TyVar(var_id) => {
                 let ref1 = ctx.ty_vars[var_id].borrow();
                 match &ref1.0 {
-                    None => if ref1.1 > ctx.level {
-                        PolyVar(var_id)
-                    } else {
-                        self
-                    },
-                    Some(_) => {
-                        self
+                    None => {
+                        if ref1.1 > ctx.level {
+                            PolyVar(var_id)
+                        } else {
+                            self
+                        }
                     }
+                    Some(_) => self,
                 }
-            },
-            Fun(arg, ret) => {
-                Fun(Box::new(arg.generalize(ctx)), Box::new(ret.generalize(ctx)))
-            },
-            Int | Bool | PolyVar(_) => self
+            }
+            Fun(arg, ret) => Fun(Box::new(arg.generalize(ctx)), Box::new(ret.generalize(ctx))),
+            Int | Bool | PolyVar(_) => self,
         }
     }
 
@@ -176,12 +172,14 @@ impl Type {
     fn instantiate_inner(&self, ctx: &mut Inferer, var_map: &mut HashMap<usize, Type>) -> Type {
         use Type::*;
         match self {
-            PolyVar(var_id) => {
-                var_map.entry(*var_id).or_insert_with(|| ctx.fresh_tyvar()).clone()
-            },
-            Fun(arg, ret) => {
-                Fun(Box::new(arg.instantiate_inner(ctx, var_map)), Box::new(ret.instantiate_inner(ctx, var_map)))
-            },
+            PolyVar(var_id) => var_map
+                .entry(*var_id)
+                .or_insert_with(|| ctx.fresh_tyvar())
+                .clone(),
+            Fun(arg, ret) => Fun(
+                Box::new(arg.instantiate_inner(ctx, var_map)),
+                Box::new(ret.instantiate_inner(ctx, var_map)),
+            ),
             TyVar(var_id) => {
                 let t = ctx.ty_vars[*var_id].borrow().0.clone();
                 match t {
@@ -189,7 +187,7 @@ impl Type {
                     None => self.clone(),
                 }
             }
-            Int | Bool => self.clone()
+            Int | Bool => self.clone(),
         }
     }
 }
