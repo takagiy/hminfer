@@ -77,11 +77,16 @@ macro_rules! ast {
 #[derive(Debug, PartialEq, Clone)]
 enum Type {
     TyVar(usize),
-    Fun(Box<Type>, Box<Type>),
+    Tree(TyNode, Vec<Type>),
     Int,
     Bool,
-    Pair(Box<Type>, Box<Type>),
     PolyVar(VarId),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum TyNode {
+    Fun,
+    Pair,
 }
 
 struct TyEnv {
@@ -108,13 +113,12 @@ impl TypeVariables for Vec<RefCell<(Option<Type>, usize)>> {
     fn unify(&self, t1: &Type, t2: &Type) {
         use Type::*;
         match (t1, t2) {
-            (Fun(in1, out1), Fun(in2, out2)) => {
-                self.unify(in1, in2);
-                self.unify(out1, out2);
-            }
-            (Pair(head1, tail1), Pair(head2, tail2)) => {
-                self.unify(head1, head2);
-                self.unify(tail1, tail2);
+            (Tree(node1, children1), Tree(node2, children2))
+                if node1 == node2 && children1.len() == children2.len() =>
+            {
+                for (ct1, ct2) in children1.iter().zip(children2.iter()) {
+                    self.unify(ct1, ct2);
+                }
             }
             (TyVar(ref1), TyVar(ref2)) => {
                 if ref1 == ref2 {
@@ -175,8 +179,10 @@ impl Type {
                     Some(_) => self,
                 }
             }
-            Fun(arg, ret) => Fun(Box::new(arg.generalize(ctx)), Box::new(ret.generalize(ctx))),
-            Pair(t1, t2) => Pair(Box::new(t1.generalize(ctx)), Box::new(t2.generalize(ctx))),
+            Tree(node, children) => Tree(
+                node,
+                children.into_iter().map(|t| t.generalize(ctx)).collect(),
+            ),
             Int | Bool | PolyVar(_) => self,
         }
     }
@@ -192,13 +198,12 @@ impl Type {
                 .entry(*var_id)
                 .or_insert_with(|| ctx.fresh_tyvar())
                 .clone(),
-            Fun(arg, ret) => Fun(
-                Box::new(arg.instantiate_inner(ctx, var_map)),
-                Box::new(ret.instantiate_inner(ctx, var_map)),
-            ),
-            Pair(t1, t2) => Pair(
-                Box::new(t1.instantiate_inner(ctx, var_map)),
-                Box::new(t2.instantiate_inner(ctx, var_map)),
+            Tree(node, children) => Tree(
+                node.clone(),
+                children
+                    .iter()
+                    .map(|t| t.instantiate_inner(ctx, var_map))
+                    .collect(),
             ),
             TyVar(var_id) => {
                 let t = ctx.ty_vars[*var_id].borrow().0.clone();
@@ -236,21 +241,21 @@ impl Inferer {
             Expr::Fun { arg, body } => {
                 let t1 = self.fresh_tyvar();
                 env.extended(*arg, t1.clone(), |env| {
-                    Type::Fun(Box::new(t1), Box::new(self.infer(env, body)))
+                    Type::Tree(TyNode::Fun, vec![t1, self.infer(env, body)])
                 })
             }
             Expr::App { fun, arg } => match self.infer(env, fun) {
-                Type::Fun(mut t_in, t_out) => {
+                Type::Tree(TyNode::Fun, mut in_out) if in_out.len() == 2 => {
                     let mut t_arg = self.infer(env, arg);
-                    self.ty_vars.unify(&mut t_in, &mut t_arg);
-                    t_out.as_ref().clone()
+                    self.ty_vars.unify(&mut in_out[0], &mut t_arg);
+                    in_out[1].clone()
                 }
                 mut t_fn @ Type::TyVar(_) => {
                     let mut t_in = self.fresh_tyvar();
                     let t_out = self.fresh_tyvar();
                     self.ty_vars.unify(
                         &mut t_fn,
-                        &mut Type::Fun(Box::new(t_in.clone()), Box::new(t_out.clone())),
+                        &mut Type::Tree(TyNode::Fun, vec![t_in.clone(), t_out.clone()]),
                     );
                     let mut t_arg = self.infer(env, arg);
                     self.ty_vars.unify(&mut t_in, &mut t_arg);
@@ -261,13 +266,16 @@ impl Inferer {
             Expr::Pair { e1, e2 } => {
                 let t1 = self.infer(env, e1);
                 let t2 = self.infer(env, e2);
-                Type::Pair(Box::new(t1), Box::new(t2))
+                Type::Tree(TyNode::Pair, vec![t1, t2])
             }
             Expr::Zero => Type::Int,
             Expr::True => Type::Bool,
-            Expr::Add => Type::Fun(
-                Box::new(Type::Int),
-                Box::new(Type::Fun(Box::new(Type::Int), Box::new(Type::Int))),
+            Expr::Add => Type::Tree(
+                TyNode::Fun,
+                vec![
+                    Type::Int,
+                    Type::Tree(TyNode::Fun, vec![Type::Int, Type::Int]),
+                ],
             ),
             Expr::Ref { var } => env.map[var].instantiate(self),
         }
