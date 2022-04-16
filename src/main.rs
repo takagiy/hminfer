@@ -1,3 +1,4 @@
+#![feature(iterator_try_collect)]
 use std::{cell::RefCell, collections::HashMap};
 
 type VarId = usize;
@@ -225,6 +226,14 @@ impl Inferer {
         }
     }
 
+    fn replace_tyvars(&self, t: &Type) -> Option<Type> {
+        match t {
+            Type::TyVar(id) => self.ty_vars.get(*id).and_then(|t| t.borrow().0.clone()),
+            Type::Tree(node, children) => children.iter().map(|ct| self.replace_tyvars(ct)).try_collect().map(|cts| Type::Tree(node.clone(), cts)),
+            _ => Some(t.clone())
+        }
+    }
+
     fn fresh_tyvar(&mut self) -> Type {
         self.ty_vars.fresh_tyvar(self.level)
     }
@@ -316,8 +325,31 @@ fn main() {
     );
     let mut inferer = Inferer::new();
     let t = inferer.infer(&mut TyEnv::new(), &ast);
-    println!("{:?}", t);
-    for (i, v) in inferer.ty_vars.iter().enumerate() {
-        println!("{}: {:?}", i, v.borrow());
-    }
+    println!("{:?}", inferer.replace_tyvars(&t));
+}
+
+#[test]
+fn test_apply_make_pair() {
+    let ast = ast!(
+        let 0 = (
+            fun 1 => (
+                let 2 = (
+                    fun 3 => (pair (ref 1) (ref 3))
+                ) in (
+                ref 2
+                )
+            )
+        ) in (
+        let 4 = (app (ref 0) zero) in (
+        let 5 = (app (ref 4) true) in (
+        let 6 = (app (ref 0) (ref 5)) in (
+        app (ref 6) true
+        ))))
+    );
+    let mut inferer = Inferer::new();
+    let t = inferer.infer(&mut TyEnv::new(), &ast);
+    let t = inferer.replace_tyvars(&t);
+    use Type::*;
+    use TyNode::*;
+    assert_eq!(t, Some(Tree(Pair, vec![Tree(Pair, vec![Int, Bool]), Bool])));
 }
