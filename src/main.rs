@@ -61,12 +61,25 @@ impl Display for Type<'_> {
                 Link(t) => write!(f, "{}", t)?,
             },
         }
-        return Ok(());
+        Ok(())
     }
 }
 
-impl<'a> Type<'a> {
-    pub fn unify(&'a self, other: &'a Type<'a>) {
+trait Unify<'a>
+where
+    Self: 'a,
+{
+    fn new_unbound_var() -> Self;
+
+    fn unify(&'a self, other: &'a Self);
+}
+
+impl<'a> Unify<'a> for Type<'a> {
+    fn new_unbound_var() -> Type<'a> {
+        Type::Var(RefCell::new(TypeVar::Unbound))
+    }
+
+    fn unify(&'a self, other: &'a Type<'a>) {
         use Type::*;
 
         match (self, other) {
