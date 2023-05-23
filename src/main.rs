@@ -215,7 +215,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn alloc_var(&'a self) -> &'a Type<'a> {
-        self.arena.alloc(Type::Var(RefCell::new(TypeVar::Unbound)))
+        self.arena.alloc(Type::new_unbound_var())
     }
 }
 
