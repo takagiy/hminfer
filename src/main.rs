@@ -149,6 +149,10 @@ impl<'a> TypeChecker<'a> {
             ILit(_) => self.arena.alloc(Type::Primitive(Primitive::Int)),
             BLit(_) => self.arena.alloc(Type::Primitive(Primitive::Bool)),
             VarRef(name) => env.variable_types[name],
+            Tuple(items) => self.arena.alloc(Type::Apply(
+                Constructor::Tuple,
+                items.iter().map(|item| self.infer(item, env)).collect(),
+            )),
             If {
                 condition,
                 then,
@@ -216,6 +220,10 @@ fn main() {
         ast! {
             let f = (func x => x) in
             let y = (f 1) in false
+        },
+        ast! {
+            let pair = (1, true) in
+            let x = 2 in pair, x
         },
     ];
     for ast in asts {

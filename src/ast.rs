@@ -3,6 +3,7 @@ pub enum Expr {
     VarRef(String),
     ILit(i64),
     BLit(bool),
+    Tuple(Vec<Expr>),
     If {
         condition: Box<Expr>,
         then: Box<Expr>,
@@ -59,6 +60,9 @@ macro_rules! ast {
             definition: Box::new(ast!($definition)),
             body: Box::new(ast!($($body)*)),
         }
+    };
+    ($head:tt $(,$rest:tt)*) => {
+        Expr::Tuple(vec![ast!($head), $(ast!($rest)),*])
     };
     ($function:tt $($argument:tt)*) => {
         Expr::Apply {
