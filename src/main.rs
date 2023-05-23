@@ -78,8 +78,8 @@ impl<'a> Type<'a> {
                     left.unify(right);
                 }
             }
-            (Var(left), _) => left.borrow_mut().unify(other),
-            (_, Var(right)) => right.borrow_mut().unify(self),
+            (Var(left), right) => left.borrow_mut().unify(right),
+            (left, Var(right)) => right.borrow_mut().unify(left),
             _ => panic!("unsatisfiable constraint: {:?} = {:?}", self, other),
         }
     }
@@ -90,8 +90,8 @@ impl<'a> TypeVar<'a> {
         use TypeVar::*;
 
         match (self, other) {
-            (left @ Unbound, _) => {
-                *left = Link(other);
+            (left @ Unbound, right) => {
+                *left = Link(right);
             }
             (Link(left), right) => {
                 if let Type::Var(right) = right {
