@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Display, Formatter},
     iter,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use typed_arena::Arena;
 
@@ -18,8 +19,9 @@ pub enum Type<'a> {
 
 #[derive(Debug, Clone)]
 pub enum TypeVar<'a> {
-    Unbound { level: usize },
+    Unbound { id: usize, level: usize },
     Link(&'a Type<'a>),
+    Poly { id: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,24 +61,16 @@ impl Display for Type<'_> {
             Var(var) => match *var.borrow() {
                 Unbound { .. } => write!(f, "?")?,
                 Link(t) => write!(f, "{}", t)?,
+                Poly { id } => write!(f, "'{}", id)?,
             },
         }
         Ok(())
     }
 }
 
-trait Unify<'a>
-where
-    Self: 'a,
-{
-    fn new_unbound_var(level: usize) -> Self;
-
-    fn unify(&'a self, other: &'a Self);
-}
-
-impl<'a> Unify<'a> for Type<'a> {
-    fn new_unbound_var(level: usize) -> Type<'a> {
-        Type::Var(RefCell::new(TypeVar::Unbound { level }))
+impl<'a> Type<'a> {
+    fn new_unbound_var(id: usize, level: usize) -> Type<'a> {
+        Type::Var(RefCell::new(TypeVar::Unbound { id, level }))
     }
 
     fn unify(&'a self, other: &'a Type<'a>) {
@@ -96,6 +90,64 @@ impl<'a> Unify<'a> for Type<'a> {
             _ => panic!("unsatisfiable constraint: {:?} = {:?}", self, other),
         }
     }
+
+    fn generalized(&'a self, level: usize, arena: &'a Arena<Self>) -> &'a Type<'a> {
+        use Type::*;
+
+        match self {
+            Primitive(_) => self,
+            Apply(ctor, args) => arena.alloc(Apply(
+                ctor.clone(),
+                args.into_iter()
+                    .map(|arg| arg.generalized(level, arena))
+                    .collect(),
+            )),
+            Var(var) => match *var.borrow() {
+                TypeVar::Link(t) => t.generalized(level, arena),
+                TypeVar::Poly { .. } => self,
+                TypeVar::Unbound {
+                    id,
+                    level: var_level,
+                } => {
+                    if var_level > level {
+                        arena.alloc(Var(RefCell::new(TypeVar::Poly { id })))
+                    } else {
+                        self
+                    }
+                }
+            },
+        }
+    }
+
+    pub fn instance(&'a self, level: usize, arena: &'a Arena<Self>) -> &'a Type<'a> {
+        self.instance_rec(level, arena, &mut HashMap::new())
+    }
+
+    fn instance_rec(
+        &'a self,
+        level: usize,
+        arena: &'a Arena<Self>,
+        context: &mut HashMap<usize, &'a Self>,
+    ) -> &'a Type<'a> {
+        use Type::*;
+
+        match self {
+            Primitive(_) => self,
+            Apply(ctor, args) => arena.alloc(Apply(
+                ctor.clone(),
+                args.iter()
+                    .map(|arg| arg.instance_rec(level, arena, context))
+                    .collect(),
+            )),
+            Var(var) => match *var.borrow() {
+                TypeVar::Link(t) => t.instance_rec(level, arena, context),
+                TypeVar::Unbound { .. } => self,
+                TypeVar::Poly { id } => context
+                    .entry(id)
+                    .or_insert_with(|| arena.alloc(Type::new_unbound_var(id, level))),
+            },
+        }
+    }
 }
 
 impl<'a> TypeVar<'a> {
@@ -107,7 +159,7 @@ impl<'a> TypeVar<'a> {
                 (left, Link(right)) => {
                     return left.unify(right);
                 }
-                (Unbound { level: llevel }, Unbound { level: rlevel }) => {
+                (Unbound { level: llevel, .. }, Unbound { level: rlevel, .. }) => {
                     *rlevel = *llevel.min(rlevel);
                 }
                 _ => {}
@@ -120,6 +172,7 @@ impl<'a> TypeVar<'a> {
             (Link(left), right) => {
                 left.unify(right);
             }
+            (Poly { .. }, _) => panic!("uninstantiated type variable"),
         }
     }
 }
@@ -152,12 +205,14 @@ impl<'a> TypeEnv<'a> {
 
 struct TypeChecker<'arena> {
     arena: Arena<Type<'arena>>,
+    fresh_var_id: AtomicUsize,
 }
 
 impl<'a> TypeChecker<'a> {
     pub fn new() -> TypeChecker<'a> {
         TypeChecker {
             arena: Arena::new(),
+            fresh_var_id: AtomicUsize::new(0),
         }
     }
 
@@ -201,7 +256,9 @@ impl<'a> TypeChecker<'a> {
                 function,
                 arguments,
             } => {
-                let function_type = self.infer(function, env, level);
+                let function_type = self
+                    .infer(function, env, level)
+                    .instance(level, &self.arena);
                 let argument_types = arguments
                     .iter()
                     .map(|argument| self.infer(argument, env, level));
@@ -218,7 +275,9 @@ impl<'a> TypeChecker<'a> {
                 definition,
                 body,
             } => {
-                let definition_type = self.infer(definition, env, level + 1);
+                let definition_type = self
+                    .infer(definition, env, level + 1)
+                    .generalized(level, &self.arena);
                 env.with(variable.clone(), definition_type, |env| {
                     self.infer(body, env, level)
                 })
@@ -227,7 +286,8 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn alloc_var(&'a self, level: usize) -> &'a Type<'a> {
-        self.arena.alloc(Type::new_unbound_var(level))
+        let id = self.fresh_var_id.fetch_add(1, Ordering::Relaxed);
+        self.arena.alloc(Type::new_unbound_var(id, level))
     }
 }
 
@@ -249,6 +309,9 @@ fn main() {
         ast! {
             let pair = (1, true) in
             let x = 2 in pair, x
+        },
+        ast! {
+            let make_pair = (func x => func y => (x, y)) in make_pair
         },
     ];
     for ast in asts {
