@@ -313,6 +313,15 @@ fn main() {
         ast! {
             let make_pair = (func x => func y => (x, y)) in make_pair
         },
+        ast! {
+            let make_pair = (func x => let f = (func y => (x, y)) in f) in make_pair
+        },
+        ast! {
+            let make_pair = (func x => let f = (func y => (x, y)) in f) in
+            let pair_1 = ((make_pair 1) true) in
+            let pair_2 = (let make_pair = (make_pair true) in (make_pair true)) in
+            pair_1, pair_2
+        },
     ];
     for ast in asts {
         println!("AST: {:?}", ast);
