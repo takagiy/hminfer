@@ -18,7 +18,7 @@ pub enum Type<'a> {
 
 #[derive(Debug, Clone)]
 pub enum TypeVar<'a> {
-    Unbound,
+    Unbound { level: usize },
     Link(&'a Type<'a>),
 }
 
@@ -57,7 +57,7 @@ impl Display for Type<'_> {
                 write!(f, ")")?;
             }
             Var(var) => match *var.borrow() {
-                Unbound => write!(f, "?")?,
+                Unbound { .. } => write!(f, "?")?,
                 Link(t) => write!(f, "{}", t)?,
             },
         }
@@ -69,14 +69,14 @@ trait Unify<'a>
 where
     Self: 'a,
 {
-    fn new_unbound_var() -> Self;
+    fn new_unbound_var(level: usize) -> Self;
 
     fn unify(&'a self, other: &'a Self);
 }
 
 impl<'a> Unify<'a> for Type<'a> {
-    fn new_unbound_var() -> Type<'a> {
-        Type::Var(RefCell::new(TypeVar::Unbound))
+    fn new_unbound_var(level: usize) -> Type<'a> {
+        Type::Var(RefCell::new(TypeVar::Unbound { level }))
     }
 
     fn unify(&'a self, other: &'a Type<'a>) {
@@ -102,16 +102,22 @@ impl<'a> TypeVar<'a> {
     pub fn unify(&mut self, other: &'a Type<'a>) {
         use TypeVar::*;
 
+        if let Type::Var(other) = other {
+            match (&mut *self, &mut *other.borrow_mut()) {
+                (left, Link(right)) => {
+                    return left.unify(right);
+                }
+                (Unbound { level: llevel }, Unbound { level: rlevel }) => {
+                    *rlevel = *llevel.min(rlevel);
+                }
+                _ => {}
+            }
+        }
         match (self, other) {
-            (left @ Unbound, right) => {
+            (left @ Unbound { .. }, right) => {
                 *left = Link(right);
             }
             (Link(left), right) => {
-                if let Type::Var(right) = right {
-                    if let Link(right) = *right.borrow() {
-                        return left.unify(right);
-                    }
-                }
                 left.unify(right);
             }
         }
@@ -155,7 +161,7 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    pub fn infer(&'a self, expr: &Expr, env: &mut TypeEnv<'a>) -> &'a Type<'a> {
+    pub fn infer(&'a self, expr: &Expr, env: &mut TypeEnv<'a>, level: usize) -> &'a Type<'a> {
         use Expr::*;
 
         match expr {
@@ -164,24 +170,28 @@ impl<'a> TypeChecker<'a> {
             VarRef(name) => env.variable_types[name],
             Tuple(items) => self.arena.alloc(Type::Apply(
                 Constructor::Tuple,
-                items.iter().map(|item| self.infer(item, env)).collect(),
+                items
+                    .iter()
+                    .map(|item| self.infer(item, env, level))
+                    .collect(),
             )),
             If {
                 condition,
                 then,
                 otherwise,
             } => {
-                let condition_type = self.infer(condition, env);
-                let then_type = self.infer(then, env);
-                let otherwise_type = self.infer(otherwise, env);
+                let condition_type = self.infer(condition, env, level);
+                let then_type = self.infer(then, env, level);
+                let otherwise_type = self.infer(otherwise, env, level);
                 condition_type.unify(self.arena.alloc(Type::Primitive(Primitive::Bool)));
                 then_type.unify(otherwise_type);
                 then_type
             }
             Lambda { argument, body } => {
-                let argument_type = self.alloc_var();
-                let return_type =
-                    env.with(argument.clone(), argument_type, |env| self.infer(body, env));
+                let argument_type = self.alloc_var(level);
+                let return_type = env.with(argument.clone(), argument_type, |env| {
+                    self.infer(body, env, level)
+                });
                 self.arena.alloc(Type::Apply(
                     Constructor::Func,
                     vec![argument_type, return_type],
@@ -191,9 +201,11 @@ impl<'a> TypeChecker<'a> {
                 function,
                 arguments,
             } => {
-                let function_type = self.infer(function, env);
-                let argument_types = arguments.iter().map(|argument| self.infer(argument, env));
-                let return_type = self.alloc_var();
+                let function_type = self.infer(function, env, level);
+                let argument_types = arguments
+                    .iter()
+                    .map(|argument| self.infer(argument, env, level));
+                let return_type = self.alloc_var(level);
                 let expected_function_type = self.arena.alloc(Type::Apply(
                     Constructor::Func,
                     argument_types.chain(iter::once(return_type)).collect(),
@@ -206,16 +218,16 @@ impl<'a> TypeChecker<'a> {
                 definition,
                 body,
             } => {
-                let definition_type = self.infer(definition, env);
+                let definition_type = self.infer(definition, env, level + 1);
                 env.with(variable.clone(), definition_type, |env| {
-                    self.infer(body, env)
+                    self.infer(body, env, level)
                 })
             }
         }
     }
 
-    fn alloc_var(&'a self) -> &'a Type<'a> {
-        self.arena.alloc(Type::new_unbound_var())
+    fn alloc_var(&'a self, level: usize) -> &'a Type<'a> {
+        self.arena.alloc(Type::new_unbound_var(level))
     }
 }
 
@@ -243,7 +255,7 @@ fn main() {
         println!("AST: {:?}", ast);
         let mut env = TypeEnv::new();
         let checker = TypeChecker::new();
-        let ty = checker.infer(&ast, &mut env);
+        let ty = checker.infer(&ast, &mut env, 0);
         println!("Type: {}", ty);
     }
 }
