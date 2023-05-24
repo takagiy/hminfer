@@ -59,9 +59,9 @@ impl Display for Type<'_> {
                 write!(f, ")")?;
             }
             Var(var) => match *var.borrow() {
-                Unbound { .. } => write!(f, "?")?,
-                Link(t) => write!(f, "{}", t)?,
-                Poly { id } => write!(f, "'{}", id)?,
+                Unbound { id, level } => write!(f, "'?{id}({level})")?,
+                Link(t) => write!(f, "{t}")?,
+                Poly { id } => write!(f, "'{id}")?,
             },
         }
         Ok(())
