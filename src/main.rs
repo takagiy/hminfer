@@ -138,63 +138,61 @@ impl<'a> Type<'a> {
         }
     }
 
-    fn generalized(&'a self, level: usize, arena: &'a Arena<Self>) -> &'a Type<'a> {
+    fn generalized(&'a self, level: usize, ctx: &'a InferContext<'a>) -> &'a Type<'a> {
         use Type::*;
 
         match self {
             Primitive(_) => self,
-            Apply(ctor, args) => arena.alloc(Apply(
+            Apply(ctor, args) => ctx.types.alloc(Apply(
                 ctor.clone(),
-                args.iter()
-                    .map(|arg| arg.generalized(level, arena))
-                    .collect(),
+                args.iter().map(|arg| arg.generalized(level, ctx)).collect(),
             )),
             Var(var) => match *var.borrow() {
-                TypeVar::Link(t) => t.generalized(level, arena),
+                TypeVar::Link(t) => t.generalized(level, ctx),
                 TypeVar::Poly { .. } => self,
                 TypeVar::Unbound {
                     id,
                     level: var_level,
                 } => {
                     if var_level > level {
-                        arena.alloc(Var(RefCell::new(TypeVar::Poly { id })))
+                        ctx.types.alloc(Var(RefCell::new(TypeVar::Poly { id })))
                     } else {
                         self
                     }
                 }
             },
-            Record(row) => arena.alloc(Record(row.generalized(level, arena))),
+            Record(row) => ctx.types.alloc(Record(row.generalized(level, ctx))),
         }
     }
 
-    pub fn instance(&'a self, level: usize, arena: &'a Arena<Self>) -> &'a Type<'a> {
-        self.instance_rec(level, arena, &mut HashMap::new())
+    pub fn instance(&'a self, level: usize, ctx: &'a InferContext<'a>) -> &'a Type<'a> {
+        self.instance_rec(level, ctx, &mut HashMap::new())
     }
 
     fn instance_rec(
         &'a self,
         level: usize,
-        arena: &'a Arena<Self>,
+        ctx: &'a InferContext<'a>,
         context: &mut HashMap<usize, &'a Self>,
     ) -> &'a Type<'a> {
         use Type::*;
 
         match self {
             Primitive(_) => self,
-            Apply(ctor, args) => arena.alloc(Apply(
+            Apply(ctor, args) => ctx.types.alloc(Apply(
                 ctor.clone(),
                 args.iter()
-                    .map(|arg| arg.instance_rec(level, arena, context))
+                    .map(|arg| arg.instance_rec(level, ctx, context))
                     .collect(),
             )),
             Var(var) => match *var.borrow() {
-                TypeVar::Link(t) => t.instance_rec(level, arena, context),
+                TypeVar::Link(t) => t.instance_rec(level, ctx, context),
                 TypeVar::Unbound { .. } => self,
                 TypeVar::Poly { id } => context
                     .entry(id)
-                    .or_insert_with(|| arena.alloc(Type::new_unbound_var(id, level))),
+                    .or_insert_with(|| ctx.types.alloc(Type::new_unbound_var(id, level))),
             },
-            Record(row) => arena.alloc(Record(row.instance(level, arena, context))),
+            Record(row) => ctx.types.alloc(Record(row.instance(level, ctx, context))),
         }
     }
 }
@@ -227,7 +225,7 @@ impl<'a> TypeVar<'a> {
 }
 
 impl<'a> Row<'a> {
-    pub fn unify(&self, other: &Self, ctx: &'a InferContext<'a>) {
+    pub fn unify(&'a self, other: &'a Self, ctx: &'a InferContext<'a>) {
         use itertools::EitherOrBoth::*;
 
         let presences = self
@@ -249,9 +247,10 @@ impl<'a> Row<'a> {
                 }
             }
         }
+        let level = self.base_var_level().min(*other.base_var_level());
         let rest = RefCell::new(RowVar::Unbound {
             id: ctx.fresh_var_id(),
-            level: usize::MAX,
+            level,
         });
         let left = ctx.rows.alloc(Row {
             columns: rcolumns,
@@ -263,6 +262,35 @@ impl<'a> Row<'a> {
         });
         self.rest.borrow_mut().unify(left, ctx);
         other.rest.borrow_mut().unify(right, ctx);
+    }
+
+    pub fn generalized(&'a self, level: usize, ctx: &'a InferContext<'a>) -> &'a Self {
+        let columns = self
+            .columns
+            .iter()
+            .map(|(label, t)| (label.clone(), t.generalized(level, ctx)))
+            .collect();
+        let rest = match *self.rest.borrow() {
+            RowVar::Unbound {
+                id,
+                level: var_level,
+            } if var_level > level => RowVar::Poly { id },
+            RowVar::Link(row) => RowVar::Link(row.generalized(level, ctx)),
+            ref other => other.clone(),
+        };
+        ctx.rows.alloc(Row {
+            columns,
+            rest: RefCell::new(rest),
+        })
+    }
+
+    pub fn instance(
+        &'a self,
+        level: usize,
+        ctx: &'a InferContext<'a>,
+        context: &mut HashMap<usize, &'a Type<'a>>,
+    ) -> &'a Self {
+        unimplemented!()
     }
 
     pub fn base_var(&'a self) -> &RefCell<RowVar<'a>> {
@@ -410,9 +438,7 @@ impl<'a> InferContext<'a> {
                 function,
                 arguments,
             } => {
-                let function_type = self
-                    .infer(function, env, level)
-                    .instance(level, &self.types);
+                let function_type = self.infer(function, env, level).instance(level, &self);
                 let argument_types = arguments
                     .iter()
                     .map(|argument| self.infer(argument, env, level));
@@ -431,7 +457,7 @@ impl<'a> InferContext<'a> {
             } => {
                 let definition_type = self
                     .infer(definition, env, level + 1)
-                    .generalized(level, &self.types);
+                    .generalized(level, &self);
                 env.with(variable.clone(), definition_type, |env| {
                     self.infer(body, env, level)
                 })
@@ -481,17 +507,18 @@ fn main() {
             pair_1, pair_2
         },
         ast! {
-            let record = { foo: 1, bar: true } in record.foo
-        },
-        ast! {
-            let f = (func record => if (record.foo) then (record.bar) else (record.baz)) in f
+            let f = (func record =>
+                if (record.foo) then (record.bar) else (record.baz))
+            in f
         },
     ];
     for ast in asts {
         println!("AST: {:?}", ast);
+        println!("");
         let mut env = TypeEnv::new();
-        let checker = InferContext::new();
-        let ty = checker.infer(&ast, &mut env, 0);
+        let ctx = InferContext::new();
+        let ty = ctx.infer(&ast, &mut env, 0);
         println!("Type: {}", ty);
+        println!("")
     }
 }
