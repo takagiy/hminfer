@@ -4,6 +4,11 @@ pub enum Expr {
     ILit(i64),
     BLit(bool),
     Tuple(Vec<Expr>),
+    Record(Vec<(String, Expr)>),
+    Projection {
+        record: Box<Expr>,
+        label: String,
+    },
     If {
         condition: Box<Expr>,
         then: Box<Expr>,
@@ -59,6 +64,15 @@ macro_rules! ast {
             variable: stringify!($variable).to_string(),
             definition: Box::new(ast!($definition)),
             body: Box::new(ast!($($body)*)),
+        }
+    };
+    ({ $($label:ident : $value:tt),* }) => {
+        Expr::Record(vec![ $( (stringify!($label).to_string(), ast!($value)) ),* ])
+    };
+    ( $record:tt . $label:ident ) => {
+        Expr::Projection {
+            record: Box::new(ast!($record)),
+            label: stringify!($label).to_string(),
         }
     };
     ($head:tt $(,$rest:tt)*) => {

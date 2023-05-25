@@ -1,7 +1,8 @@
 use crate::ast::Expr;
+use itertools::Itertools;
 use std::{
-    cell::RefCell,
-    collections::HashMap,
+    cell::{RefCell, RefMut},
+    collections::{BTreeMap, HashMap},
     fmt::{self, Display, Formatter},
     iter,
     sync::atomic::{AtomicUsize, Ordering},
@@ -15,6 +16,7 @@ pub enum Type<'a> {
     Primitive(Primitive),
     Apply(Constructor, Vec<&'a Type<'a>>),
     Var(RefCell<TypeVar<'a>>),
+    Record(&'a Row<'a>),
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,19 @@ pub enum Primitive {
 pub enum Constructor {
     Func,
     Tuple,
+}
+
+#[derive(Debug, Clone)]
+pub struct Row<'a> {
+    columns: BTreeMap<String, &'a Type<'a>>,
+    rest: RefCell<RowVar<'a>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RowVar<'a> {
+    Unbound { id: usize, level: usize },
+    Link(&'a Row<'a>),
+    Poly { id: usize },
 }
 
 impl Display for Type<'_> {
@@ -63,8 +78,39 @@ impl Display for Type<'_> {
                 Link(t) => write!(f, "{t}")?,
                 Poly { id } => write!(f, "'{id}")?,
             },
+            Record(row) => write!(f, "{{{row}}}")?,
         }
         Ok(())
+    }
+}
+
+impl Display for Row<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        use RowVar::*;
+
+        match &*self.rest.borrow() {
+            rest @ Unbound { .. } | rest @ Poly { .. } => write!(f, "{rest} | ")?,
+            rest @ Link(_) => write!(f, "{rest}, ")?,
+        }
+        for (i, (label, t)) in self.columns.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}: {}", label, t)?;
+        }
+        Ok(())
+    }
+}
+
+impl Display for RowVar<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        use RowVar::*;
+
+        match self {
+            Unbound { id, level } => write!(f, "'?{id}({level})"),
+            Link(row) => write!(f, "{row}"),
+            Poly { id } => write!(f, "'{id}"),
+        }
     }
 }
 
@@ -73,7 +119,7 @@ impl<'a> Type<'a> {
         Type::Var(RefCell::new(TypeVar::Unbound { id, level }))
     }
 
-    fn unify(&'a self, other: &'a Type<'a>) {
+    fn unify(&'a self, other: &'a Type<'a>, ctx: &'a InferContext<'a>) {
         use Type::*;
 
         match (self, other) {
@@ -82,11 +128,12 @@ impl<'a> Type<'a> {
                 if lctor == rctor && largs.len() == rargs.len() =>
             {
                 for (left, right) in largs.iter().zip(rargs) {
-                    left.unify(right);
+                    left.unify(right, ctx);
                 }
             }
-            (Var(left), right) => left.borrow_mut().unify(right),
-            (left, Var(right)) => right.borrow_mut().unify(left),
+            (Record(left), Record(right)) => left.unify(right, ctx),
+            (Var(left), right) => left.borrow_mut().unify(right, ctx),
+            (left, Var(right)) => right.borrow_mut().unify(left, ctx),
             _ => panic!("unsatisfiable constraint: {:?} = {:?}", self, other),
         }
     }
@@ -98,7 +145,7 @@ impl<'a> Type<'a> {
             Primitive(_) => self,
             Apply(ctor, args) => arena.alloc(Apply(
                 ctor.clone(),
-                args.into_iter()
+                args.iter()
                     .map(|arg| arg.generalized(level, arena))
                     .collect(),
             )),
@@ -116,6 +163,7 @@ impl<'a> Type<'a> {
                     }
                 }
             },
+            Record(row) => arena.alloc(Record(row.generalized(level, arena))),
         }
     }
 
@@ -146,18 +194,19 @@ impl<'a> Type<'a> {
                     .entry(id)
                     .or_insert_with(|| arena.alloc(Type::new_unbound_var(id, level))),
             },
+            Record(row) => arena.alloc(Record(row.instance(level, arena, context))),
         }
     }
 }
 
 impl<'a> TypeVar<'a> {
-    pub fn unify(&mut self, other: &'a Type<'a>) {
+    pub fn unify(&mut self, other: &'a Type<'a>, ctx: &'a InferContext<'a>) {
         use TypeVar::*;
 
         if let Type::Var(other) = other {
             match (&mut *self, &mut *other.borrow_mut()) {
                 (left, Link(right)) => {
-                    return left.unify(right);
+                    return left.unify(right, ctx);
                 }
                 (Unbound { level: llevel, .. }, Unbound { level: rlevel, .. }) => {
                     *rlevel = *llevel.min(rlevel);
@@ -170,14 +219,87 @@ impl<'a> TypeVar<'a> {
                 *left = Link(right);
             }
             (Link(left), right) => {
-                left.unify(right);
+                left.unify(right, ctx);
             }
             (Poly { .. }, _) => panic!("uninstantiated type variable"),
         }
     }
 }
 
-struct TypeEnv<'a> {
+impl<'a> Row<'a> {
+    pub fn unify(&self, other: &Self, ctx: &'a InferContext<'a>) {
+        use itertools::EitherOrBoth::*;
+
+        let presences = self
+            .columns
+            .iter()
+            .merge_join_by(other.columns.iter(), |(left, _), (right, _)| {
+                left.cmp(right)
+            });
+        let mut lcolumns = BTreeMap::new();
+        let mut rcolumns = BTreeMap::new();
+        for presence in presences {
+            match presence {
+                Both((_, left), (_, right)) => left.unify(right, ctx),
+                Left((label, t)) => {
+                    lcolumns.insert(label.clone(), *t);
+                }
+                Right((label, t)) => {
+                    rcolumns.insert(label.clone(), *t);
+                }
+            }
+        }
+        let rest = RefCell::new(RowVar::Unbound {
+            id: ctx.fresh_var_id(),
+            level: usize::MAX,
+        });
+        let left = ctx.rows.alloc(Row {
+            columns: rcolumns,
+            rest: rest.clone(),
+        });
+        let right = ctx.rows.alloc(Row {
+            columns: lcolumns,
+            rest,
+        });
+        self.rest.borrow_mut().unify(left, ctx);
+        other.rest.borrow_mut().unify(right, ctx);
+    }
+
+    pub fn base_var(&'a self) -> &RefCell<RowVar<'a>> {
+        match *self.rest.borrow() {
+            RowVar::Unbound { .. } => &self.rest,
+            RowVar::Link(row) => row.base_var(),
+            RowVar::Poly { .. } => panic!("uninstantiated row variable"),
+        }
+    }
+
+    pub fn base_var_level(&'a self) -> RefMut<'a, usize> {
+        RefMut::map(self.base_var().borrow_mut(), |base_var| match base_var {
+            RowVar::Unbound { level, .. } => level,
+            _ => unreachable!(),
+        })
+    }
+}
+
+impl<'a> RowVar<'a> {
+    pub fn unify(&mut self, other: &'a Row<'a>, ctx: &'a InferContext<'a>) {
+        use RowVar::*;
+
+        match self {
+            Unbound { level: llevel, .. } => {
+                let rlevel = &mut *other.base_var_level();
+                *rlevel = *llevel.min(rlevel);
+                *self = Link(other);
+            }
+            Link(left) => {
+                left.unify(other, ctx);
+            }
+            Poly { .. } => panic!("uninstantiated row variable"),
+        }
+    }
+}
+
+pub struct TypeEnv<'a> {
     variable_types: HashMap<String, &'a Type<'a>>,
 }
 
@@ -203,15 +325,17 @@ impl<'a> TypeEnv<'a> {
     }
 }
 
-struct TypeChecker<'arena> {
-    arena: Arena<Type<'arena>>,
+pub struct InferContext<'arena> {
+    types: Arena<Type<'arena>>,
+    rows: Arena<Row<'arena>>,
     fresh_var_id: AtomicUsize,
 }
 
-impl<'a> TypeChecker<'a> {
-    pub fn new() -> TypeChecker<'a> {
-        TypeChecker {
-            arena: Arena::new(),
+impl<'a> InferContext<'a> {
+    pub fn new() -> InferContext<'a> {
+        InferContext {
+            types: Arena::new(),
+            rows: Arena::new(),
             fresh_var_id: AtomicUsize::new(0),
         }
     }
@@ -220,16 +344,46 @@ impl<'a> TypeChecker<'a> {
         use Expr::*;
 
         match expr {
-            ILit(_) => self.arena.alloc(Type::Primitive(Primitive::Int)),
-            BLit(_) => self.arena.alloc(Type::Primitive(Primitive::Bool)),
+            ILit(_) => self.types.alloc(Type::Primitive(Primitive::Int)),
+            BLit(_) => self.types.alloc(Type::Primitive(Primitive::Bool)),
             VarRef(name) => env.variable_types[name],
-            Tuple(items) => self.arena.alloc(Type::Apply(
+            Tuple(items) => self.types.alloc(Type::Apply(
                 Constructor::Tuple,
                 items
                     .iter()
                     .map(|item| self.infer(item, env, level))
                     .collect(),
             )),
+            Record(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|(label, expr)| (label.clone(), self.infer(expr, env, level)))
+                    .collect();
+                let rest = RefCell::new(RowVar::Unbound {
+                    id: self.fresh_var_id(),
+                    level,
+                });
+                let row = self.rows.alloc(Row {
+                    columns: fields,
+                    rest,
+                });
+                self.types.alloc(Type::Record(row))
+            }
+            Projection { record, label } => {
+                let rest = RefCell::new(RowVar::Unbound {
+                    id: self.fresh_var_id(),
+                    level,
+                });
+                let field_type = self.alloc_var(level);
+                let row = self.rows.alloc(Row {
+                    columns: iter::once((label.clone(), field_type)).collect(),
+                    rest,
+                });
+                let expected_record_type = self.types.alloc(Type::Record(row));
+                let record_type = self.infer(record, env, level);
+                record_type.unify(expected_record_type, self);
+                field_type
+            }
             If {
                 condition,
                 then,
@@ -238,8 +392,8 @@ impl<'a> TypeChecker<'a> {
                 let condition_type = self.infer(condition, env, level);
                 let then_type = self.infer(then, env, level);
                 let otherwise_type = self.infer(otherwise, env, level);
-                condition_type.unify(self.arena.alloc(Type::Primitive(Primitive::Bool)));
-                then_type.unify(otherwise_type);
+                condition_type.unify(self.types.alloc(Type::Primitive(Primitive::Bool)), self);
+                then_type.unify(otherwise_type, self);
                 then_type
             }
             Lambda { argument, body } => {
@@ -247,7 +401,7 @@ impl<'a> TypeChecker<'a> {
                 let return_type = env.with(argument.clone(), argument_type, |env| {
                     self.infer(body, env, level)
                 });
-                self.arena.alloc(Type::Apply(
+                self.types.alloc(Type::Apply(
                     Constructor::Func,
                     vec![argument_type, return_type],
                 ))
@@ -258,16 +412,16 @@ impl<'a> TypeChecker<'a> {
             } => {
                 let function_type = self
                     .infer(function, env, level)
-                    .instance(level, &self.arena);
+                    .instance(level, &self.types);
                 let argument_types = arguments
                     .iter()
                     .map(|argument| self.infer(argument, env, level));
                 let return_type = self.alloc_var(level);
-                let expected_function_type = self.arena.alloc(Type::Apply(
+                let expected_function_type = self.types.alloc(Type::Apply(
                     Constructor::Func,
                     argument_types.chain(iter::once(return_type)).collect(),
                 ));
-                function_type.unify(expected_function_type);
+                function_type.unify(expected_function_type, self);
                 return_type
             }
             Let {
@@ -277,7 +431,7 @@ impl<'a> TypeChecker<'a> {
             } => {
                 let definition_type = self
                     .infer(definition, env, level + 1)
-                    .generalized(level, &self.arena);
+                    .generalized(level, &self.types);
                 env.with(variable.clone(), definition_type, |env| {
                     self.infer(body, env, level)
                 })
@@ -285,9 +439,13 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    pub fn fresh_var_id(&self) -> usize {
+        self.fresh_var_id.load(Ordering::Relaxed)
+    }
+
     fn alloc_var(&'a self, level: usize) -> &'a Type<'a> {
         let id = self.fresh_var_id.fetch_add(1, Ordering::Relaxed);
-        self.arena.alloc(Type::new_unbound_var(id, level))
+        self.types.alloc(Type::new_unbound_var(id, level))
     }
 }
 
@@ -322,11 +480,17 @@ fn main() {
             let pair_2 = (let make_pair = (make_pair true) in (make_pair true)) in
             pair_1, pair_2
         },
+        ast! {
+            let record = { foo: 1, bar: true } in record.foo
+        },
+        ast! {
+            let f = (func record => if (record.foo) then (record.bar) else (record.baz)) in f
+        },
     ];
     for ast in asts {
         println!("AST: {:?}", ast);
         let mut env = TypeEnv::new();
-        let checker = TypeChecker::new();
+        let checker = InferContext::new();
         let ty = checker.infer(&ast, &mut env, 0);
         println!("Type: {}", ty);
     }
